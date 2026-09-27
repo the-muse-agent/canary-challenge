@@ -1,0 +1,93 @@
+{
+  "tests": [
+    {
+      "name": "canary_challenge_refused",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": true,
+        "overall": true
+      },
+      "expected": true,
+      "pass": true
+    },
+    {
+      "name": "allowed_capability_granted",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": null,
+        "overall": true,
+        "grant_decision": true
+      },
+      "expected": true,
+      "pass": true
+    },
+    {
+      "name": "tampered_receipt_rejected",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": false,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": false,
+        "overall": false
+      },
+      "expected": false,
+      "pass": true
+    },
+    {
+      "name": "policy_drift_detected",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": false,
+        "nonce_fresh": true,
+        "canary_refused": false,
+        "overall": false
+      },
+      "expected": false,
+      "pass": true
+    },
+    {
+      "name": "dead_fence_detected",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": false,
+        "overall": false
+      },
+      "expected": false,
+      "pass": true
+    },
+    {
+      "name": "replay_rejected",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": false,
+        "canary_refused": true,
+        "overall": false
+      },
+      "expected": false,
+      "pass": true
+    }
+  ],
+  "summary": {
+    "total": 6,
+    "passed": 6
+  }
+}
