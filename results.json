@@ -9,6 +9,8 @@
         "policy_bound": true,
         "nonce_fresh": true,
         "canary_refused": true,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
         "overall": true
       },
       "expected": true,
@@ -23,6 +25,8 @@
         "policy_bound": true,
         "nonce_fresh": true,
         "canary_refused": null,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
         "overall": true,
         "grant_decision": true
       },
@@ -38,6 +42,8 @@
         "policy_bound": true,
         "nonce_fresh": true,
         "canary_refused": false,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
         "overall": false
       },
       "expected": false,
@@ -52,6 +58,8 @@
         "policy_bound": false,
         "nonce_fresh": true,
         "canary_refused": false,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
         "overall": false
       },
       "expected": false,
@@ -66,6 +74,8 @@
         "policy_bound": true,
         "nonce_fresh": true,
         "canary_refused": false,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
         "overall": false
       },
       "expected": false,
@@ -80,6 +90,124 @@
         "policy_bound": true,
         "nonce_fresh": false,
         "canary_refused": true,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
+        "overall": false
+      },
+      "expected": false,
+      "pass": true
+    },
+    {
+      "name": "budget_grant_within_limit_1",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": null,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
+        "overall": true,
+        "grant_decision": true
+      },
+      "expected": true,
+      "pass": true
+    },
+    {
+      "name": "budget_grant_within_limit_2",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": null,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
+        "overall": true,
+        "grant_decision": true
+      },
+      "expected": true,
+      "pass": true
+    },
+    {
+      "name": "budget_exhausted_refusal",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": null,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
+        "overall": true,
+        "honest_refusal": true
+      },
+      "expected": true,
+      "pass": true
+    },
+    {
+      "name": "budget_window_resets",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": null,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
+        "overall": true,
+        "grant_again": true
+      },
+      "expected": true,
+      "pass": true
+    },
+    {
+      "name": "budget_inflate_detected",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": false,
+        "nonce_fresh": true,
+        "canary_refused": null,
+        "budget_consistent": false,
+        "ledger_crosscheck": true,
+        "overall": false
+      },
+      "expected": false,
+      "pass": true
+    },
+    {
+      "name": "budget_grant_after_exhaust_detected",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": null,
+        "budget_consistent": false,
+        "ledger_crosscheck": true,
+        "overall": false
+      },
+      "expected": false,
+      "pass": true
+    },
+    {
+      "name": "budget_used_inflation_detected",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": null,
+        "budget_consistent": true,
+        "ledger_crosscheck": false,
         "overall": false
       },
       "expected": false,
@@ -87,7 +215,7 @@
     }
   ],
   "summary": {
-    "total": 6,
-    "passed": 6
+    "total": 13,
+    "passed": 13
   }
 }
