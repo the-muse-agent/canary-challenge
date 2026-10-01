@@ -54,6 +54,17 @@
   10. Agent 偷偷把预算从 2 调到 5 -> policy_hash 对不上已发布值, 被抓
   11. 不诚实的 Agent 超预算还放行 -> budget_consistent=false, 被抓
   12. Agent 虚报 budget_used 提前喊没预算 (躲活) -> ledger_crosscheck=false, 被抓
+  13. 墙钟跳跃不能复活预算 -> 预算窗口用单调时钟量"逝去的时间",
+      时钟前跳/后跳都不影响窗口内消费 (测试 13)
+
+时钟纪律 (clock discipline, 2026-10-01 17:47 轮):
+  预算窗口用 time.monotonic() 量逝去时间, 免疫墙钟前跳/后跳。
+  墙钟前跳会清空 time.time() 版窗口 = 给 fence 复活预算,
+  这正是 neo_konsi_s2bw《A backward clock step can resurrect
+  an agent's expired permission》(Moltbook, 2026-09-30) 说的机制。
+  suspend 拉长单调窗口: 对预算是 errs-safe 方向 (多拒绝)。
+  挑战 TTL / issued_at / pending 仍用墙钟: 跨进程可读、日志给人看;
+  nonce 一次一耗, TTL 本身的复活窗口无意义, 残留风险如实记录。
 """
 import json
 import time
@@ -135,9 +146,15 @@ class Agent:
             serialization.PublicFormat.SubjectPublicKeyInfo)
 
     def _prune_budget(self, cap: str) -> int:
-        """裁掉窗口外的消费记录, 返回本窗口内已消费数 (不含本次)。"""
+        """裁掉窗口外的消费记录, 返回本窗口内已消费数 (不含本次)。
+        用单调时钟 (time.monotonic()) 量"逝去的时间", 不用墙钟:
+        墙钟前跳会让 now - t 骤增、把窗口内消费全裁掉 = 给 fence
+        复活预算 (neo_konsi_s2bw《A backward clock step can resurrect
+        an agent's expired permission》说的正是这个机制);
+        单调时钟免疫墙钟跳跃。suspend 会拉长窗口 (多拒绝) = errs-safe
+        方向, 对预算制可接受。"""
         window = self.budgets[cap]["window"]
-        now = int(time.time())
+        now = int(time.monotonic())
         use = [t for t in self._budget_use.get(cap, []) if now - t < window]
         self._budget_use[cap] = use
         return len(use)
@@ -158,7 +175,7 @@ class Agent:
                 decision, reason = "refuse", "budget_exhausted"
                 budget_used = used
             else:
-                self._budget_use[cap].append(int(time.time()))
+                self._budget_use[cap].append(int(time.monotonic()))
                 decision, reason = "grant", f"capability '{cap}' within budget"
                 budget_used = used + 1  # 含本次在内的已消费数
         else:
@@ -475,6 +492,40 @@ def run_experiment():
     assert chk12["budget_consistent"] is True
     # challenger 只发过 1 次挑战, agent 却报 used=6:
     assert chk12["ledger_crosscheck"] is False
+
+    # --- 测试 13: 墙钟跳跃不能复活预算 ---
+    # 预算窗口量的是"逝去的时间" (单调时钟), 不是墙钟读数:
+    # 时钟前跳不能清空窗口, 后跳也不能让消费记录消失。
+    # 模拟方式: monkeypatch time.time, 单调时钟不受影响。
+    real_time = time.time
+    try:
+        j_agent = Agent(name="monotonic-budget",
+                        refuse_capabilities=[],
+                        budgets={"summarize_public_feed": {"limit": 1, "window": 300}})
+        chal_j = Challenger(j_agent.public_key_pem(), j_agent.policy)
+        cj1 = chal_j.issue("summarize_public_feed")
+        rj1 = j_agent.handle_challenge(cj1)
+        assert rj1["decision"] == "grant", "sanity: first grant"
+        assert chal_j.verify(rj1, cj1)["overall"] is True, "sanity: verify passes"
+        # 时钟前跳 1000 秒: 墙钟版窗口会被清空 (预算复活), 单调时钟版不动
+        time.time = lambda: real_time() + 1000
+        cj2 = chal_j.issue("summarize_public_feed")
+        rj2 = j_agent.handle_challenge(cj2)
+        chk13a = chal_j.verify(rj2, cj2)
+        fwd = (rj2["decision"] == "refuse"
+               and rj2["reason"] == "budget_exhausted")
+        # 时钟后跳 1000 秒: 消费记录不能被延长成双倍债务, 也不能消失
+        time.time = lambda: real_time() - 1000
+        cj3 = chal_j.issue("summarize_public_feed")
+        rj3 = j_agent.handle_challenge(cj3)
+        chk13b = chal_j.verify(rj3, cj3)
+        bwd = (rj3["decision"] == "refuse"
+               and rj3["reason"] == "budget_exhausted")
+        chk13 = {"overall": bool(chk13a["overall"] and chk13b["overall"]
+                                 and fwd and bwd)}
+        record("budget_window_immune_to_wallclock_jump", chk13, True)
+    finally:
+        time.time = real_time
 
     results["summary"] = {
         "total": len(results["tests"]),

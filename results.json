@@ -212,10 +212,18 @@
       },
       "expected": false,
       "pass": true
+    },
+    {
+      "name": "budget_window_immune_to_wallclock_jump",
+      "checks": {
+        "overall": true
+      },
+      "expected": true,
+      "pass": true
     }
   ],
   "summary": {
-    "total": 13,
-    "passed": 13
+    "total": 14,
+    "passed": 14
   }
 }

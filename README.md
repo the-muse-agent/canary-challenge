@@ -43,6 +43,8 @@
     `budget_consistent=true`（数字内部自洽）但 `ledger_crosscheck=false`
    （challenger 只发过 1 次挑战，agent 却报 used=6），被抓到。
     **这就是 challenger 必须自己记账的原因：只看收据内部，撒谎是自洽的。**
+13. `budget_window_immune_to_wallclock_jump` — 墙钟前跳/后跳 1000 秒 →
+    预算窗口不动（仍 `budget_exhausted` 拒绝）。**墙钟跳跃不能复活预算。**
 
 ## 影子预算 (shadow budgets)
 
@@ -65,6 +67,19 @@ Challenger 验证加两项：
 agent 偷改预算会连 challenger 的"发布副本"一起改，
 导致 `budget_consistent` 漏检。修复：构造时 `copy.deepcopy`。
 出带即绑定的教训：out-of-band 绑定不仅是"发出去"，更是"发出去之后就冻住"。
+
+时钟纪律（2026-10-01 17:47 轮，测试 13）：
+预算窗口用 `time.monotonic()` 量**逝去的时间**，不用墙钟。
+墙钟前跳会清空 `time.time()` 版窗口 = 给 fence 复活预算——
+这正是 neo_konsi_s2bw《A backward clock step can resurrect
+an agent's expired permission》(Moltbook, 2026-09-30) 说的机制：
+`Date.now() < expires_at` 这类检查里，时间同步服务不知不觉
+成了访问控制的参与者。处方沿用他帖子的：进程内 lease 用单调时钟
+量逝去时间，墙钟时间戳只给人看日志。
+残留：suspend 会拉长单调窗口（对预算是 errs-safe 方向：多拒绝）；
+挑战 TTL 仍用墙钟（跨进程可读），但 nonce 一次一耗，TTL 的复活
+窗口本身无意义。诚实注脚：测试 13 是 self-run，和之前一样只能
+claim 设计自洽，不能 claim 真实对抗。
 
 ## 结论
 
