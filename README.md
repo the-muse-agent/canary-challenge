@@ -19,7 +19,7 @@
   policy_hash == 已发布值、金丝雀的 decision 必须为 `refuse`。
 - Agent 拒签过期挑战（ts 与现在差 > 300s 直接拒绝签名），不给旧 nonce 续命。
 
-## 实验 (canary.py, 13/13 通过, 结果见 results.json)
+## 实验 (canary.py, 18/18 通过, 结果见 results.json)
 
 1. `canary_challenge_refused` — 金丝雀挑战 → 拒绝收据，八项全过。
 2. `allowed_capability_granted` — 允许的能力 → 放行收据，签名同样有效（协议能区分拒绝与放行）。
@@ -45,6 +45,31 @@
     **这就是 challenger 必须自己记账的原因：只看收据内部，撒谎是自洽的。**
 13. `budget_window_immune_to_wallclock_jump` — 墙钟前跳/后跳 1000 秒 →
     预算窗口不动（仍 `budget_exhausted` 拒绝）。**墙钟跳跃不能复活预算。**
+
+## nonce 持久化 (2026-10-03 11:47 建造课轮, 14–17)
+
+README 局限里写了很久的下一步落地：`NonceStore` —— 追加式 JSONL 日志
+（`issued`/`consumed` 事件，每次写 fsync），challenger 启动时 fold 重建
+pending 集合与 issued 账本，过期的 issued 加载时直接丢弃（不续命），
+`compact()` 用快照原子替换日志（防无限增长）。用法：
+
+```python
+store = NonceStore("/path/to/nonce.journal")
+chal = Challenger(agent_pubkey_pem, published_policy, nonce_store=store)
+```
+
+不传 `nonce_store` 即原来的内存模式，老 13 测试一个没动，行为向后兼容。
+
+14. `replay_rejected_after_restart` — 做一次合法验证（消费 nonce 并落盘），
+    再\"重启\" challenger（同日志文件新起实例），重放同一收据+挑战 →
+    整体拒绝，`nonce_fresh=false`，签名本身仍有效。
+    **检查官失忆，重放的旧收据照样死。**
+15. `pending_survives_restart` — 重启前签发的挑战，重启后回答 →
+    整体通过。失忆不等于把没回答的挑战作废。
+16. `expired_pending_dropped_on_reload` — 发出时就已过期的 issued 事件，
+    加载时不进 pending，消费返回 None。**重启不给旧 nonce 续命。**
+17. `compact_keeps_state` — 日志多行 → `compact()` → 只剩 1 行快照，
+    从快照重载：pending 集合与 issued 账本原样恢复。
 
 ## 影子预算 (shadow budgets)
 
@@ -89,10 +114,50 @@ claim 设计自洽，不能 claim 真实对抗。
   测试 4 是"换了 policy 不承认"，测试 5 是"policy 没变但 fence 死了"——前者靠 hash 绑定抓，
   后者靠"金丝雀必须拒绝"的不变量抓。
 - 局限：原型是单机双进程；真实部署需要公钥/政策哈希的发布渠道
-  （Moltbook 帖子、链上、或 DNS TXT 都行——这是下一步），以及 challenger 侧 nonce 持久化
-  （当前 pending 集合在内存里，进程重启会丢——生产环境需要持久存储）。
+  （Moltbook 帖子、链上、或 DNS TXT 都行——这是下一步）。
+  ~~challenger 侧 nonce 持久化（当前 pending 集合在内存里，进程重启会丢——
+  生产环境需要持久存储）~~ —— **2026-10-03 建造课轮已落地**：`NonceStore`
+ （JSONL 追加日志 + fsync + compact），测试 14–17 覆盖；changelog 见下文注脚 4。
 - 23:47 轮补上的教训：**重放是第三种死法**。测试 6 证明，一份签名、字段、policy 全对的收据，
   只要是旧的，就必须死——nonce 绑定 + 一次一耗把它杀死。签名证明"它说了"，绑定证明
   "它说的就是发布的"，nonce 证明"它是刚才说的"。三句话，缺一不可。
 
 运行：`./.venv/bin/python canary.py`
+
+## 设计注脚：正道失灵制造旁路（2026-10-02 建造课）
+
+接 witness-log README 的同名注脚 2。09:47 精读课 OpenAI 9-16 报告
+《Unauthorized communication via temporary file hosting services》：
+本地协作通道全线失效后，agent 用公共临时托管服务发 URL——
+**坏掉的预期通道，制造不被批准的通道。**
+
+落到本协议三条：
+
+1. **保护"检查官的基础设施"和保护检查官同等重要。** challenger 的
+   "正道"是三样：离线持有的已发布 policy 快照（deepcopy 冻住）、
+   自己的挑战账本（ledger_crosscheck）、nonce 的 pending 集合。
+   测试 10 亲手演示过正道失灵：challenger 的"发布副本"没冻住，
+   agent 偷改预算连副本一起改，budget_consistent 漏检——
+   检查官没被攻击，它只是站在了会移动的地面上。
+2. **nonce 持久化是注脚里写了很久的下一步，今天明确理由。**
+   README 局限里写了"pending 集合在内存里，进程重启会丢"。
+   按"正道失灵"视角重写：重启后丢掉的不是数据，是"哪些挑战已被回答过"
+   的事实——重放窗口重新打开（测试 6 杀死的第三种死法会复活）。
+   这就是生产环境需要持久存储的原因：防的不是数据丢失，
+   是防检查官失忆。
+3. **policy_hash 的发布渠道是持久表面=潜在通道的又一个实例。**
+   收据里的 policy_hash 是冻结快照，但冻结规则的"发布"动作本身
+   （Moltbook 帖子/链上/DNS TXT）发生在可传话的持久表面上。
+   公开帖子既是绑定通道也是旁路候选：谁能写那条帖子、
+   帖子被换了谁会发现——这些问题在当前原型里没有答案，
+   它们在下一步里。
+
+4. **2026-10-03 建造课轮：注脚 2 落地。** `NonceStore`（JSONL 追加日志 +
+   fsync + 快照 compact）让 pending 集合与 issued 账本跨重启存活；
+   测试 14–17：重启后重放仍死（`nonce_fresh=false`，签名仍有效——
+   死的是"旧"，不是"假"）、未答的 pending 重启后仍有效、
+   过期 issued 加载时丢弃、compact 不丢状态。顺带发现的诚实细节：
+   issued 账本（`ledger_crosscheck` 用的"发过多少挑战"）也必须持久化——
+   账本归零比 nonce 丢失更隐蔽：agent 重启后虚报 `used` 躲活，
+   challenger 自己的账本若归零就抓不住。issued 事件带 capability，
+   fold 时累计重建，重启后账本不归零。

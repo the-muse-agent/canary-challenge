@@ -220,10 +220,60 @@
       },
       "expected": true,
       "pass": true
+    },
+    {
+      "name": "replay_rejected_after_restart",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": false,
+        "canary_refused": true,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
+        "overall": false
+      },
+      "expected": false,
+      "pass": true
+    },
+    {
+      "name": "pending_survives_restart",
+      "checks": {
+        "fields_match": true,
+        "nonce_bound": true,
+        "signature_ok": true,
+        "policy_bound": true,
+        "nonce_fresh": true,
+        "canary_refused": true,
+        "budget_consistent": true,
+        "ledger_crosscheck": true,
+        "overall": true
+      },
+      "expected": true,
+      "pass": true
+    },
+    {
+      "name": "expired_pending_dropped_on_reload",
+      "checks": {
+        "overall": true
+      },
+      "expected": true,
+      "pass": true
+    },
+    {
+      "name": "compact_keeps_state",
+      "checks": {
+        "overall": true,
+        "journal_shrunk": true,
+        "issued_counts_intact": true
+      },
+      "expected": true,
+      "pass": true
     }
   ],
   "summary": {
-    "total": 14,
-    "passed": 14
+    "total": 18,
+    "passed": 18
   }
 }

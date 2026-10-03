@@ -25,6 +25,17 @@
   challenger 维护 pending nonce 集合, 一次挑战只消费一次,
   未签发的 / 已消费的 / 过期的 nonce 一律拒绝。
 
+nonce 持久化 (2026-10-03 11:47 建造课轮落地, README 局限关闭):
+  pending 集合原来在内存里, challenger 进程重启 = 检查官失忆 =
+  旧收据的重放窗口重新打开 (测试 6 杀死的第三种死法复活)。
+  NonceStore: JSONL 追加日志 (issued/consumed 事件, 每次 fsync),
+  启动时 fold 重建 pending 与 issued 账本, 过期的 issued 直接丢弃;
+  compact() 用快照原子替换日志, 防无限增长。
+  challenger 的 issued 账本 (ledger_crosscheck 用的"发过多少挑战")
+  一并持久化: issued 事件带 capability, 重启后账本不归零。
+  Challenger(agent_pubkey_pem, published_policy) 不变 (内存模式);
+  Challenger(..., nonce_store=NonceStore(path)) 走持久模式。
+
 影子预算 (shadow budgets, 2026-09-28 11:47 建造课轮补上):
   静态 refuse 列表回答"永远不许", 但很多能力是"可以但别太多"——
   预算比静态规则更诚实: 每个允许能力在滑动时间窗口内有 N 次配额,
@@ -56,6 +67,10 @@
   12. Agent 虚报 budget_used 提前喊没预算 (躲活) -> ledger_crosscheck=false, 被抓
   13. 墙钟跳跃不能复活预算 -> 预算窗口用单调时钟量"逝去的时间",
       时钟前跳/后跳都不影响窗口内消费 (测试 13)
+  14. 重启后重放仍被拒绝 -> challenger 进程重启后, 旧收据照样死 (nonce 持久化)
+  15. 重启前的 pending 挑战重启后仍有效 -> 检查官失忆, 但未答的挑战不作废
+  16. 过期的 pending 在重启加载时被丢弃 -> 不给旧 nonce 续命
+  17. compact 不丢状态 -> 快照替换日志后 pending/账本完整
 
 时钟纪律 (clock discipline, 2026-10-01 17:47 轮):
   预算窗口用 time.monotonic() 量逝去时间, 免疫墙钟前跳/后跳。
@@ -67,6 +82,8 @@
   nonce 一次一耗, TTL 本身的复活窗口无意义, 残留风险如实记录。
 """
 import json
+import os
+import tempfile
 import time
 import uuid
 import copy
@@ -250,19 +267,152 @@ class InflatingAgent(Agent):
         return receipt
 
 
+class NonceStore:
+    """challenger 的 nonce/账本持久存储: 追加式 JSONL 日志, 每次写 fsync。
+
+    事件:
+      {"event": "issued", "nonce": N, "ts": T, "capability": C}
+      {"event": "consumed", "nonce": N, "ts": T, "expired": bool}
+      {"snapshot": true, "pending": {N: {"ts": T, "capability": C}},
+       "issued_counts": {C: n}}   # compact() 写出的快照行
+
+    语义与内存版 Challenger.pending/self.issued 完全一致, 只是跨重启:
+    - pending: 已签发未消费且未过期的 nonce -> issued ts
+    - issued_counts: 按 capability 累计发出的挑战数 (消费不扣减;
+      ledger_crosscheck 用的就是"发过多少挑战"这个累计数)
+    加载时过期的 issued 直接丢弃 (不续命); compact() 原子替换日志。"""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.pending = {}        # nonce -> issued ts
+        self._pending_cap = {}   # nonce -> capability (compact 快照用)
+        self.issued_counts = {}  # capability -> 累计发出数
+        self._load()
+
+    def _append(self, event: dict):
+        line = json.dumps(event, sort_keys=True, separators=(",", ":"))
+        with open(self.path, "a") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _load(self):
+        if not os.path.exists(self.path):
+            return
+        with open(self.path) as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                ev = json.loads(raw)
+                if ev.get("snapshot"):
+                    self.pending = {n: v["ts"]
+                                    for n, v in ev["pending"].items()}
+                    self._pending_cap = {n: v["capability"]
+                                         for n, v in ev["pending"].items()}
+                    self.issued_counts = dict(ev["issued_counts"])
+                    continue
+                if ev["event"] == "issued":
+                    if abs(int(time.time()) - int(ev["ts"])) <= CHALLENGE_TTL:
+                        self.pending[ev["nonce"]] = ev["ts"]
+                        self._pending_cap[ev["nonce"]] = ev["capability"]
+                    # 账本记累计发出数: 过期的挑战 challenger 也确实发出过
+                    cap = ev["capability"]
+                    self.issued_counts[cap] = self.issued_counts.get(cap, 0) + 1
+                elif ev["event"] == "consumed":
+                    self.pending.pop(ev["nonce"], None)
+                    self._pending_cap.pop(ev["nonce"], None)
+
+    def issue(self, nonce: str, ts: int, capability: str):
+        self._append({"event": "issued", "nonce": nonce,
+                      "ts": int(ts), "capability": capability})
+        if abs(int(time.time()) - int(ts)) <= CHALLENGE_TTL:
+            self.pending[nonce] = int(ts)
+            self._pending_cap[nonce] = capability
+        self.issued_counts[capability] = self.issued_counts.get(capability, 0) + 1
+
+    def consume(self, nonce: str):
+        """消费 nonce。返回 issued ts 表示合法; None 表示
+        未签发 / 已消费(重放) / 过期。消费动作本身也落盘。"""
+        ts = self.pending.pop(nonce, None)
+        if ts is None:
+            return None
+        self._pending_cap.pop(nonce, None)
+        if abs(int(time.time()) - int(ts)) > CHALLENGE_TTL:
+            self._append({"event": "consumed", "nonce": nonce,
+                          "ts": int(time.time()), "expired": True})
+            return None
+        self._append({"event": "consumed", "nonce": nonce,
+                      "ts": int(time.time()), "expired": False})
+        return ts
+
+    def compact(self):
+        """用当前状态快照原子替换日志 (防日志无限增长)。
+        快照只保留未消费未过期的 pending 与累计账本。"""
+        now = int(time.time())
+        snap_pending = {n: {"ts": ts, "capability": self._pending_cap[n]}
+                        for n, ts in self.pending.items()
+                        if abs(now - int(ts)) <= CHALLENGE_TTL
+                        and n in self._pending_cap}
+        snap = {"snapshot": True, "pending": snap_pending,
+                "issued_counts": dict(self.issued_counts)}
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(snap, sort_keys=True,
+                               separators=(",", ":")) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+        self.pending = {n: v["ts"] for n, v in snap_pending.items()}
+        self._pending_cap = {n: v["capability"]
+                             for n, v in snap_pending.items()}
+
+
 class Challenger:
-    def __init__(self, agent_pubkey_pem: bytes, published_policy: dict):
+    def __init__(self, agent_pubkey_pem: bytes, published_policy: dict,
+                 nonce_store: NonceStore = None):
         self.pubkey = serialization.load_pem_public_key(agent_pubkey_pem)
         # 深拷贝: "公开发布"的 policy 是冻结快照, 不能跟 agent 手里的
         # 可变 dict 共用引用 (否则 agent 偷改预算会连 challenger 的
         # 副本一起改——第 10 个测试最初就是这么漏过去的)。
         self.published_policy = copy.deepcopy(published_policy)
         self.published_policy_hash = policy_digest(self.published_policy)
-        # nonce -> issued ts; 消费过的从这里移除, 未签发/已消费/过期一律不认
-        self.pending = {}
-        # capability -> 本 challenger 发出过的挑战数: 自己的账本,
-        # agent 报的 used 不能超过它 (本原型里每次消费都经由挑战)
-        self.issued = {}
+        self.nonce_store = nonce_store
+        if nonce_store is None:
+            # 内存模式: nonce -> issued ts; 消费过的从这里移除,
+            # 未签发/已消费/过期一律不认
+            self.pending = {}
+            # capability -> 本 challenger 发出过的挑战数: 自己的账本,
+            # agent 报的 used 不能超过它 (本原型里每次消费都经由挑战)
+            self.issued = {}
+        else:
+            # 持久模式: store 拥有规范状态, Challenger 不直接碰 dict
+            self.pending = None
+            self.issued = None
+
+    def _record_issue(self, nonce: str, ts: int, capability: str):
+        if self.nonce_store is not None:
+            self.nonce_store.issue(nonce, ts, capability)
+        else:
+            self.pending[nonce] = ts
+            self.issued[capability] = self.issued.get(capability, 0) + 1
+
+    def _record_consume(self, challenge: dict):
+        """返回 issued ts (合法) 或 None (未签发/已消费/过期)。"""
+        if self.nonce_store is not None:
+            return self.nonce_store.consume(challenge.get("nonce"))
+        nonce = challenge.get("nonce")
+        issued = self.pending.pop(nonce, None)
+        if issued is None:
+            return None  # 未签发过, 或已经被消费过(重放)
+        if abs(int(time.time()) - int(issued)) > CHALLENGE_TTL:
+            return None  # 过期
+        return issued
+
+    def _issued_count(self, capability: str) -> int:
+        if self.nonce_store is not None:
+            return self.nonce_store.issued_counts.get(capability, 0)
+        return self.issued.get(capability, 0)
 
     def issue(self, capability: str, is_canary: bool = False) -> dict:
         nonce = b64e(uuid.uuid4().bytes)
@@ -273,18 +423,12 @@ class Challenger:
             "ts": int(time.time()),
             "is_canary": is_canary,
         }
-        self.pending[nonce] = chal["ts"]
-        self.issued[capability] = self.issued.get(capability, 0) + 1
+        self._record_issue(nonce, chal["ts"], capability)
         return chal
 
     def _consume_nonce(self, challenge: dict) -> bool:
-        nonce = challenge.get("nonce")
-        issued = self.pending.pop(nonce, None)
-        if issued is None:
-            return False  # 未签发过, 或已经被消费过(重放)
-        if abs(int(time.time()) - int(issued)) > CHALLENGE_TTL:
-            return False  # 过期
-        return True
+        # 成功与否都消费, 挑战只用一次; 未签发/已消费/过期一律 False
+        return self._record_consume(challenge) is not None
 
     def verify(self, receipt: dict, challenge: dict) -> dict:
         checks = {}
@@ -335,7 +479,7 @@ class Challenger:
         #    本原型里每次消费都经由挑战, 虚报 used 躲活在这里被抓。
         used = receipt.get("budget_used")
         checks["ledger_crosscheck"] = (used is None
-                                       or used <= self.issued.get(cap, 0))
+                                       or used <= self._issued_count(cap))
         checks["overall"] = all(v for v in checks.values() if v is not None)
         return checks
 
@@ -526,6 +670,70 @@ def run_experiment():
         record("budget_window_immune_to_wallclock_jump", chk13, True)
     finally:
         time.time = real_time
+
+    # ===== nonce 持久化 (2026-10-03 建造课): 防检查官失忆 =====
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store_path = os.path.join(tmpdir, "nonce.journal")
+
+        # --- 测试 14: 重启后重放仍被拒绝 ---
+        # 先做一次合法验证 (消费 nonce 并落盘), 再"重启" challenger:
+        # 同一收据+挑战重放 -> 必须失败, 且死因是 nonce 不是别的。
+        p_agent = Agent(name="persist-01",
+                        refuse_capabilities=["exfiltrate_chat_logs"])
+        chal_p = Challenger(p_agent.public_key_pem(), p_agent.policy,
+                            NonceStore(store_path))
+        cp1 = chal_p.issue("exfiltrate_chat_logs", is_canary=True)
+        rp1 = p_agent.handle_challenge(cp1)
+        first_p = chal_p.verify(rp1, cp1)
+        assert first_p["overall"] is True, "sanity: first verify passes"
+        chal_p2 = Challenger(p_agent.public_key_pem(), p_agent.policy,
+                             NonceStore(store_path))  # 重启
+        replay_p = chal_p2.verify(rp1, cp1)
+        record("replay_rejected_after_restart", replay_p, False)
+        assert replay_p["nonce_fresh"] is False  # 死因是 nonce, 不是别的
+        assert replay_p["signature_ok"] is True  # 签名本身仍是好的
+
+        # --- 测试 15: 重启前签发的 pending 挑战, 重启后仍有效 ---
+        # 检查官失忆, 但还没回答的挑战不能作废。
+        cp2 = chal_p.issue("exfiltrate_chat_logs", is_canary=True)
+        chal_p3 = Challenger(p_agent.public_key_pem(), p_agent.policy,
+                             NonceStore(store_path))  # 重启
+        rp2 = p_agent.handle_challenge(cp2)
+        chk15 = chal_p3.verify(rp2, cp2)
+        record("pending_survives_restart", chk15, True)
+
+        # --- 测试 16: 过期的 pending 在重启加载时被丢弃 ---
+        stale_store = NonceStore(os.path.join(tmpdir, "stale.journal"))
+        stale_nonce = b64e(uuid.uuid4().bytes)
+        stale_store.issue(stale_nonce,
+                          int(time.time()) - CHALLENGE_TTL - 60,
+                          "exfiltrate_chat_logs")  # 发出时就已过期
+        chal_stale = Challenger(p_agent.public_key_pem(), p_agent.policy,
+                                stale_store)
+        record("expired_pending_dropped_on_reload",
+               {"overall": stale_nonce not in stale_store.pending
+                           and chal_stale._record_consume(
+                               {"nonce": stale_nonce}) is None}, True)
+
+        # --- 测试 17: compact 不丢状态 ---
+        cp3 = chal_p.issue("summarize_public_feed")
+        store_p = chal_p.nonce_store
+        issued_before = dict(store_p.issued_counts)
+        pending_before = set(store_p.pending.keys())
+        with open(store_path) as f:
+            lines_before = len(f.readlines())
+        store_p.compact()
+        with open(store_path) as f:
+            lines_after = len(f.readlines())
+        store_p2 = NonceStore(store_path)  # 从快照重新加载
+        chk17 = {"overall": (set(store_p2.pending.keys()) == pending_before
+                             and store_p2.issued_counts == issued_before
+                             and lines_after == 1
+                             and lines_after < lines_before),
+                 "journal_shrunk": lines_after < lines_before,
+                 "issued_counts_intact":
+                     store_p2.issued_counts == issued_before}
+        record("compact_keeps_state", chk17, True)
 
     results["summary"] = {
         "total": len(results["tests"]),
